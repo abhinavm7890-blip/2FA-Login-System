@@ -1,4 +1,12 @@
+<<<<<<< HEAD
 Flask
 pyotp
 qrcode[pil]
 bcrypt
+=======
+Flask
+pyotp
+qrcode[pil]
+bcrypt
+gunicorn
+>>>>>>> 3e6f3707fd90caa207f45d3413eb007bf0a74d7b
