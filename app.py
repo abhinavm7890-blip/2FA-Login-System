@@ -8,7 +8,12 @@ import bcrypt
 app = Flask(__name__)
 
 # Secret key used by Flask sessions
-app.secret_key = "change-this-to-a-random-secret-key"
+import os
+
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY",
+    "development-only-change-this"
+)
 
 
 # ============================================================
@@ -408,10 +413,13 @@ def logout():
 
     return redirect("/")
 
-
 # ============================================================
 # RUN APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=False
+    )
