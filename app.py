@@ -11,10 +11,16 @@ app = Flask(__name__)
 import os
 
 app.secret_key = os.environ.get(
-    "FLASK_SECRET_KEY"
+    "FLASK_SECRET_KEY",
     "development-only-change-this"
 )
 
+# Secure session cookie settings
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax"
+)
 
 # ============================================================
 # USER LOGIN DETAILS
