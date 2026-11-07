@@ -1,65 +1,322 @@
 from flask import Flask, render_template_string, request, redirect, session
-import pyotp
-import qrcode
+import os
+import sqlite3
 import io
 import base64
+import re
 import bcrypt
+import pyotp
+import qrcode
 
 app = Flask(__name__)
 
-# Secret key used by Flask sessions
-import os
-
-app = Flask(__name__)
-
-app.secret_key = (
-    os.environ.get("FLASK_SECRET_KEY")
-    or "development-only-change-this"
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY",
+    "development-only-change-this"
 )
 
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax"
-)
-# ============================================================
-# USER LOGIN DETAILS
-# ============================================================
-
-USERNAME = "admin"
-
-# Original password: 1234
-# NEVER store the real password directly.
-PASSWORD_HASH = bcrypt.hashpw(
-    b"1234",
-    bcrypt.gensalt()
+    SESSION_COOKIE_SECURE=os.environ.get(
+        "COOKIE_SECURE", "false"
+    ).lower() == "true",
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=1800
 )
 
+# =====================================================
+# DATABASE
+# =====================================================
 
-# ============================================================
-# TOTP SECRET
-# ============================================================
-# IMPORTANT:
-# Keep this secret the same after the QR code is scanned.
-# In a real application, store this securely in a database.
-
-TOTP_SECRET = "6MG4Y3GPB5DUXLV7NEIELCS24ZEO4W7W"
-
-totp = pyotp.TOTP(TOTP_SECRET)
+DATABASE = os.environ.get("DATABASE_PATH", "users.db")
 
 
-# ============================================================
-# GENERATE QR CODE
-# ============================================================
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def generate_qr_code():
 
-    provisioning_uri = totp.provisioning_uri(
-        name=USERNAME,
-        issuer_name="My 2FA Login"
+def create_database():
+    conn = get_db()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash BLOB NOT NULL,
+            totp_secret TEXT NOT NULL,
+            totp_enabled INTEGER DEFAULT 0
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+create_database()
+
+
+# =====================================================
+# COMMON DESIGN
+# =====================================================
+
+BASE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Secure 2FA Login System</title>
+
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <style>
+        * { box-sizing: border-box; }
+
+        body {
+            background: #101827;
+            color: white;
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .box {
+            background: #1e293b;
+            padding: 35px;
+            border-radius: 16px;
+            width: 100%;
+            max-width: 420px;
+            text-align: center;
+            box-shadow: 0 10px 35px #0005;
+        }
+
+        h1 { color: #38bdf8; }
+
+        input {
+            width: 100%;
+            padding: 14px;
+            margin: 10px 0;
+            border-radius: 8px;
+            border: none;
+            font-size: 15px;
+        }
+
+        button {
+            width: 100%;
+            padding: 13px;
+            margin-top: 15px;
+            background: #16a34a;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        button:hover { background: #15803d; }
+
+        a { color: #38bdf8; }
+
+        .error { color: #f87171; }
+
+        .success { color: #4ade80; }
+
+        img {
+            max-width: 260px;
+            width: 100%;
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+        }
+
+        .links { margin-top: 20px; }
+    </style>
+</head>
+
+<body>
+    {{ content|safe }}
+</body>
+</html>
+"""
+
+
+def show_page(template, **kwargs):
+    content = render_template_string(template, **kwargs)
+    return render_template_string(BASE, content=content)
+
+
+# =====================================================
+# HOME PAGE
+# =====================================================
+
+HOME_PAGE = """
+<div class="box">
+
+    <h1>🔐 Secure Login System</h1>
+
+    <p>Welcome to Multi-User Two-Factor Authentication</p>
+
+    <a href="/signup">
+        <button>Create New Account - Sign Up</button>
+    </a>
+
+    <a href="/login">
+        <button>Existing User - Sign In</button>
+    </a>
+
+</div>
+"""
+
+
+@app.route("/")
+def home():
+    return show_page(HOME_PAGE)
+
+
+# =====================================================
+# SIGNUP
+# =====================================================
+
+SIGNUP_PAGE = """
+<div class="box">
+
+    <h1>Create Account</h1>
+
+    <p>Register your own secure account.</p>
+
+    {% if error %}
+        <p class="error">{{ error }}</p>
+    {% endif %}
+
+    <form method="POST">
+
+        <input
+            type="text"
+            name="username"
+            placeholder="Create Username"
+            minlength="3"
+            maxlength="30"
+            required
+        >
+
+        <input
+            type="password"
+            name="password"
+            placeholder="Create Password"
+            required
+        >
+
+        <input
+            type="password"
+            name="confirm_password"
+            placeholder="Confirm Password"
+            required
+        >
+
+        <button type="submit">Sign Up</button>
+
+    </form>
+
+    <div class="links">
+        Already have an account?
+        <a href="/login">Sign In</a>
+    </div>
+
+</div>
+"""
+
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+
+    if request.method == "POST":
+
+        username = request.form.get(
+            "username", ""
+        ).strip().lower()
+
+        password = request.form.get(
+            "password", ""
+        )
+
+        confirm_password = request.form.get(
+            "confirm_password", ""
+        )
+
+        if not re.fullmatch(r"[a-z0-9_]{3,30}", username):
+            return show_page(
+                SIGNUP_PAGE,
+                error="Username must be 3-30 characters (letters, numbers and underscore)."
+            )
+
+        if password != confirm_password:
+            return show_page(
+                SIGNUP_PAGE,
+                error="Passwords do not match."
+            )
+
+        if len(password) < 10 or len(password.encode("utf-8")) > 72:
+            return show_page(
+                SIGNUP_PAGE,
+                error="Password must be at least 10 characters and at most 72 bytes."
+            )
+
+        password_hash = bcrypt.hashpw(
+            password.encode("utf-8"),
+            bcrypt.gensalt()
+        )
+
+        # Each user gets a different TOTP secret.
+        secret = pyotp.random_base32()
+
+        conn = get_db()
+
+        try:
+            cursor = conn.execute("""
+                INSERT INTO users
+                (username, password_hash, totp_secret)
+                VALUES (?, ?, ?)
+            """, (username, password_hash, secret))
+
+            user_id = cursor.lastrowid
+            conn.commit()
+
+        except sqlite3.IntegrityError:
+            conn.close()
+
+            return show_page(
+                SIGNUP_PAGE,
+                error="Username already exists. Choose another."
+            )
+
+        conn.close()
+
+        session.clear()
+        session["setup_user_id"] = user_id
+
+        return redirect("/setup-2fa")
+
+    return show_page(SIGNUP_PAGE, error=None)
+
+
+# =====================================================
+# GENERATE PERSONAL QR CODE
+# =====================================================
+
+def generate_qr(secret, username):
+
+    totp = pyotp.TOTP(secret)
+
+    uri = totp.provisioning_uri(
+        name=username,
+        issuer_name="Secure 2FA Login"
     )
 
-    qr = qrcode.make(provisioning_uri)
+    qr = qrcode.make(uri)
 
     buffer = io.BytesIO()
     qr.save(buffer, format="PNG")
@@ -69,63 +326,121 @@ def generate_qr_code():
     ).decode("utf-8")
 
 
-# ============================================================
-# LOGIN PAGE
-# ============================================================
+# =====================================================
+# FIRST-TIME 2FA SETUP
+# =====================================================
 
-LOGIN_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Login</title>
-
-    <style>
-        body {
-            background: #111;
-            color: white;
-            font-family: Arial;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-        }
-
-        .box {
-            background: #222;
-            padding: 40px;
-            border-radius: 15px;
-            width: 350px;
-            text-align: center;
-        }
-
-        input {
-            width: 90%;
-            padding: 12px;
-            margin: 10px;
-            border-radius: 6px;
-            border: none;
-        }
-
-        button {
-            padding: 12px 30px;
-            border: none;
-            border-radius: 6px;
-            background: #4CAF50;
-            color: white;
-            cursor: pointer;
-        }
-
-        .error {
-            color: #ff5555;
-        }
-    </style>
-</head>
-
-<body>
-
+SETUP_PAGE = """
 <div class="box">
 
-    <h1>Login</h1>
+    <h1>Setup Google Authenticator</h1>
+
+    <p>Scan your personal QR code using Google Authenticator.</p>
+
+    <img src="data:image/png;base64,{{ qr_code }}">
+
+    <p>Enter the 6-digit code shown in your app.</p>
+
+    {% if error %}
+        <p class="error">{{ error }}</p>
+    {% endif %}
+
+    <form method="POST">
+
+        <input
+            type="text"
+            name="code"
+            placeholder="6-digit code"
+            maxlength="6"
+            pattern="[0-9]{6}"
+            inputmode="numeric"
+            required
+        >
+
+        <button type="submit">Verify and Activate</button>
+
+    </form>
+
+</div>
+"""
+
+
+@app.route("/setup-2fa", methods=["GET", "POST"])
+def setup_2fa():
+
+    user_id = session.get("setup_user_id")
+
+    if not user_id:
+        return redirect("/signup")
+
+    conn = get_db()
+
+    user = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if not user:
+        session.clear()
+        return redirect("/signup")
+
+    if request.method == "POST":
+
+        code = request.form.get("code", "").strip()
+
+        totp = pyotp.TOTP(user["totp_secret"])
+
+        if totp.verify(code, valid_window=1):
+
+            conn = get_db()
+
+            conn.execute("""
+                UPDATE users
+                SET totp_enabled = 1
+                WHERE id = ?
+            """, (user_id,))
+
+            conn.commit()
+            conn.close()
+
+            session.clear()
+            session["authenticated"] = True
+            session["user_id"] = user_id
+            session["username"] = user["username"]
+
+            return redirect("/dashboard")
+
+        return show_page(
+            SETUP_PAGE,
+            qr_code=generate_qr(
+                user["totp_secret"],
+                user["username"]
+            ),
+            error="Invalid code. Please try again."
+        )
+
+    return show_page(
+        SETUP_PAGE,
+        qr_code=generate_qr(
+            user["totp_secret"],
+            user["username"]
+        ),
+        error=None
+    )
+
+
+# =====================================================
+# SIGNIN
+# =====================================================
+
+LOGIN_PAGE = """
+<div class="box">
+
+    <h1>Sign In</h1>
+
+    <p>Enter your registered account details.</p>
 
     {% if error %}
         <p class="error">{{ error }}</p>
@@ -147,102 +462,76 @@ LOGIN_PAGE = """
             required
         >
 
-        <br>
-
-        <button type="submit">
-            Login
-        </button>
+        <button type="submit">Sign In</button>
 
     </form>
 
-</div>
+    <div class="links">
+        New user?
+        <a href="/signup">Create Account</a>
+    </div>
 
-</body>
-</html>
+</div>
 """
 
 
-# ============================================================
-# 2FA PAGE
-# ============================================================
+@app.route("/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "POST":
+
+        username = request.form.get(
+            "username", ""
+        ).strip().lower()
+
+        password = request.form.get(
+            "password", ""
+        )
+
+        conn = get_db()
+
+        user = conn.execute("""
+            SELECT * FROM users
+            WHERE username = ?
+        """, (username,)).fetchone()
+
+        conn.close()
+
+        if not user or not bcrypt.checkpw(
+            password.encode("utf-8"),
+            user["password_hash"]
+        ):
+
+            return show_page(
+                LOGIN_PAGE,
+                error="Invalid username or password."
+            )
+
+        if not user["totp_enabled"]:
+            session.clear()
+            session["setup_user_id"] = user["id"]
+            return redirect("/setup-2fa")
+
+        session.clear()
+        session["pending_user_id"] = user["id"]
+
+        return redirect("/2fa")
+
+    return show_page(LOGIN_PAGE, error=None)
+
+
+# =====================================================
+# LOGIN 2FA VERIFICATION
+# =====================================================
 
 TWO_FA_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-
-    <title>2FA Verification</title>
-
-    <style>
-
-        body {
-            background: #111;
-            color: white;
-            font-family: Arial;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-        }
-
-        .box {
-            background: #222;
-            padding: 40px;
-            border-radius: 15px;
-            width: 500px;
-            text-align: center;
-        }
-
-        img {
-            width: 300px;
-            height: 300px;
-            background: white;
-            padding: 10px;
-        }
-
-        input {
-            width: 90%;
-            padding: 15px;
-            margin: 15px;
-            font-size: 24px;
-            text-align: center;
-            letter-spacing: 8px;
-        }
-
-        button {
-            padding: 12px 30px;
-            border: none;
-            border-radius: 6px;
-            background: #4CAF50;
-            color: white;
-            cursor: pointer;
-        }
-
-        .error {
-            color: #ff5555;
-        }
-
-    </style>
-
-</head>
-
-<body>
-
 <div class="box">
 
-    <h1>Two-Factor Authentication</h1>
+    <h1>Two-Factor Verification</h1>
 
-    <p>
-        Scan this QR code using Google Authenticator.
-    </p>
+    <p>Welcome, {{ username }}!</p>
 
-    <img
-        src="data:image/png;base64,{{ qr_code }}"
-    >
-
-    <p>
-        Then enter the 6-digit code:
-    </p>
+    <p>Enter your Google Authenticator code.</p>
 
     {% if error %}
         <p class="error">{{ error }}</p>
@@ -253,164 +542,111 @@ TWO_FA_PAGE = """
         <input
             type="text"
             name="code"
+            placeholder="000000"
             maxlength="6"
             pattern="[0-9]{6}"
-            placeholder="000000"
+            inputmode="numeric"
             required
         >
 
-        <br>
-
-        <button type="submit">
-            Verify
-        </button>
+        <button type="submit">Verify Login</button>
 
     </form>
 
 </div>
-
-</body>
-</html>
 """
 
-
-# ============================================================
-# SUCCESS PAGE
-# ============================================================
-
-SUCCESS_PAGE = """
-<!DOCTYPE html>
-<html>
-
-<head>
-    <title>Login Successful</title>
-
-    <style>
-        body {
-            background: #111;
-            color: white;
-            font-family: Arial;
-            text-align: center;
-            padding-top: 150px;
-        }
-
-        .success {
-            color: #4CAF50;
-        }
-    </style>
-
-</head>
-
-<body>
-
-    <h1 class="success">
-        Login Successful!
-    </h1>
-
-    <p>
-        Username, password and TOTP verification completed.
-    </p>
-
-</body>
-
-</html>
-"""
-
-
-# ============================================================
-# LOGIN ROUTE
-# ============================================================
-
-@app.route("/", methods=["GET", "POST"])
-def login():
-
-    if request.method == "POST":
-
-        username = request.form["username"]
-        password = request.form["password"]
-
-        # Check username
-        if username != USERNAME:
-            return render_template_string(
-                LOGIN_PAGE,
-                error="Invalid username or password."
-            )
-
-        # Check password using bcrypt
-        password_correct = bcrypt.checkpw(
-            password.encode("utf-8"),
-            PASSWORD_HASH
-        )
-
-        if not password_correct:
-            return render_template_string(
-                LOGIN_PAGE,
-                error="Invalid username or password."
-            )
-
-        # Password is correct.
-        # Move user to 2FA step.
-        session["password_verified"] = True
-
-        return redirect("/2fa")
-
-    return render_template_string(
-        LOGIN_PAGE,
-        error=None
-    )
-
-
-# ============================================================
-# 2FA ROUTE
-# ============================================================
 
 @app.route("/2fa", methods=["GET", "POST"])
 def two_fa():
 
-    # User must pass password first
-    if not session.get("password_verified"):
-        return redirect("/")
+    user_id = session.get("pending_user_id")
+
+    if not user_id:
+        return redirect("/login")
+
+    conn = get_db()
+
+    user = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if not user or not user["totp_enabled"]:
+        session.clear()
+        return redirect("/login")
 
     if request.method == "POST":
 
-        code = request.form["code"]
+        code = request.form.get("code", "").strip()
 
-        # Verify TOTP code
-        if totp.verify(code):
+        totp = pyotp.TOTP(user["totp_secret"])
+
+        if totp.verify(code, valid_window=1):
+
+            session.clear()
 
             session["authenticated"] = True
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
 
-            return redirect("/success")
+            return redirect("/dashboard")
 
-        return render_template_string(
+        return show_page(
             TWO_FA_PAGE,
-            qr_code=generate_qr_code(),
+            username=user["username"],
             error="Invalid authentication code."
         )
 
-    return render_template_string(
+    return show_page(
         TWO_FA_PAGE,
-        qr_code=generate_qr_code(),
+        username=user["username"],
         error=None
     )
 
 
-# ============================================================
-# SUCCESS ROUTE
-# ============================================================
+# =====================================================
+# USER DASHBOARD
+# =====================================================
 
-@app.route("/success")
-def success():
+DASHBOARD_PAGE = """
+<div class="box">
+
+    <h1 class="success">Login Successful!</h1>
+
+    <h2>Welcome, {{ username }}!</h2>
+
+    <p>Your account is securely authenticated.</p>
+
+    <p>Username: {{ username }}</p>
+
+    <p>Two-Factor Authentication: Enabled ✓</p>
+
+    <a href="/logout">
+        <button>Logout</button>
+    </a>
+
+</div>
+"""
+
+
+@app.route("/dashboard")
+def dashboard():
 
     if not session.get("authenticated"):
-        return redirect("/")
+        return redirect("/login")
 
-    return render_template_string(SUCCESS_PAGE)
+    return show_page(
+        DASHBOARD_PAGE,
+        username=session["username"]
+    )
 
 
-# ============================================================
+# =====================================================
 # LOGOUT
-# ============================================================
+# =====================================================
 
 @app.route("/logout")
 def logout():
@@ -419,11 +655,13 @@ def logout():
 
     return redirect("/")
 
-# ============================================================
+
+# =====================================================
 # RUN APPLICATION
-# ============================================================
+# =====================================================
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
