@@ -23,6 +23,13 @@ app.config.update(
     ).lower() == "true",
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=1800
+    @app.route('/')
+def home():
+    return '''
+    <h1>Welcome to 2FA Login System</h1>
+    <p>Your application is running successfully!</p>
+    <a href="/login">Login</a>
+    '''
 )
 
 # =====================================================
