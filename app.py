@@ -1,6 +1,7 @@
 from flask import Flask, render_template_string, request, redirect, session
 import os
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import io
 import base64
 import re
@@ -25,33 +26,58 @@ app.config.update(
 )
 
 # =====================================================
-# DATABASE
+# DATABASE - SUPABASE POSTGRESQL
 # =====================================================
 
-DATABASE = os.environ.get("DATABASE_PATH", "users.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+class DatabaseConnection:
+    """Small adapter that keeps the existing conn.execute() style."""
+
+    def __init__(self):
+        if not DATABASE_URL:
+            raise RuntimeError(
+                "DATABASE_URL is missing. Add your Supabase connection "
+                "string in Render > Environment."
+            )
+        self.connection = psycopg2.connect(
+            DATABASE_URL,
+            sslmode="require",
+            cursor_factory=RealDictCursor
+        )
+
+    def execute(self, query, params=()):
+        cursor = self.connection.cursor()
+        cursor.execute(query.replace("?", "%s"), params)
+        return cursor
+
+    def commit(self):
+        self.connection.commit()
+
+    def close(self):
+        self.connection.close()
 
 
 def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DatabaseConnection()
 
 
 def create_database():
     conn = get_db()
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash BLOB NOT NULL,
-            totp_secret TEXT NOT NULL,
-            totp_enabled INTEGER DEFAULT 0
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                username VARCHAR(30) UNIQUE NOT NULL,
+                password_hash BYTEA NOT NULL,
+                totp_secret TEXT NOT NULL,
+                totp_enabled BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 create_database()
@@ -280,12 +306,13 @@ def signup():
                 INSERT INTO users
                 (username, password_hash, totp_secret)
                 VALUES (?, ?, ?)
-            """, (username, password_hash, secret))
+                RETURNING id
+            """, (username, psycopg2.Binary(password_hash), secret))
 
-            user_id = cursor.lastrowid
+            user_id = cursor.fetchone()["id"]
             conn.commit()
 
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
             conn.close()
 
             return show_page(
@@ -499,7 +526,7 @@ def login():
 
         if not user or not bcrypt.checkpw(
             password.encode("utf-8"),
-            user["password_hash"]
+            bytes(user["password_hash"])
         ):
 
             return show_page(
